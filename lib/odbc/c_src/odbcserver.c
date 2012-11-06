@@ -149,6 +149,7 @@ static db_result_msg db_select_count(byte *sql,db_state *state);
 static db_result_msg db_select(byte *args, db_state *state);
 static db_result_msg db_param_query(byte *buffer, db_state *state);
 static db_result_msg db_describe_table(byte *sql, db_state *state);
+static db_result_msg db_auto_commit(byte *how, db_state *state);
 
 /* ------------- Encode/decode functions -------- ------------------------*/
 
@@ -420,6 +421,8 @@ static db_result_msg handle_db_request(byte *reqstring, db_state *state)
 	return db_param_query(args, state);
     case DESCRIBE:
 	return db_describe_table(args, state);
+    case AUTO_COMMIT:
+    return db_auto_commit(args, state);
     default:
 	DO_EXIT(EXIT_FAILURE); /* Should not happen */
     }  
@@ -942,6 +945,24 @@ static db_result_msg db_describe_table(byte *sql, db_state *state)
     msg.length = dynamic_buffer(state).index; 
     msg.dyn_alloc = TRUE;
     return msg;
+}
+
+static db_result_msg db_auto_commit(byte *how, db_state *state)
+{
+    SQLLEN auto_commit_mode;
+
+    if(how[0] == ON) {
+	    auto_commit_mode = SQL_AUTOCOMMIT_ON;
+    } else {
+	    auto_commit_mode = SQL_AUTOCOMMIT_OFF;
+    }
+
+    if(!sql_success(SQLSetConnectAttr(connection_handle(state),
+				      SQL_ATTR_AUTOCOMMIT,
+				      (SQLPOINTER)auto_commit_mode, 0)))
+	    DO_EXIT(EXIT_AUTO_COMMIT);
+
+    return encode_atom_message("ok");
 }
 
 

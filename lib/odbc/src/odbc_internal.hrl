@@ -49,6 +49,7 @@
 -define(PARAM_QUERY,		16).
 -define(DESCRIBE,               17).
 -define(SHUTDOWN,		18).
+-define(AUTO_COMMIT,    19).
 -define(LENGTH_INDICATOR_SIZE,	4).
 -define(INT_VALUE,		1).
 -define(STR_VALUE,		2).
@@ -104,6 +105,7 @@
 -define(EXIT_DESC,		 21).
 -define(EXIT_BIND,		 22).
 -define(EXIT_DRIVER_INFO,        23).
+-define(EXIT_AUTO_COMMIT,        24).
 
 %% Misc constants
 -define(DEFAULT_TIMEOUT, infinity).
@@ -160,6 +162,8 @@
 		 could_not_bind_data_buffers;
 	    (?EXIT_DRIVER_INFO) ->
 		 collecting_of_driver_information_faild;
+        (?EXIT_AUTO_COMMIT) ->
+         changing_auto_commit;
 	    (_) ->
 		 killed
 	 end)).

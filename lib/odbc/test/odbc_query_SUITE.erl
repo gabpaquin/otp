@@ -49,6 +49,7 @@ all() ->
 	     not_connection_owner, no_result_set, query_error,
 	     {group, multiple_result_sets},
 	     {group, parameterized_queries}, {group, describe_table},
+         auto_commit,
 	     delete_nonexisting_row];
 	Other -> {skip, Other}
     end.
@@ -1456,6 +1457,41 @@ describe_no_such_table(Config) when is_list(Config) ->
 
     {error, _ } = odbc:describe_table(Ref, Table),
     ok.
+
+%%-------------------------------------------------------------------------
+
+auto_commit(doc) ->
+    ["Test auto_commit/2 after connection is established."];
+auto_commit(suite) ->
+    [];
+auto_commit(Config) when is_list(Config) ->
+    Ref1 = ?config(connection_ref, Config),
+    {ok, Ref2} =  odbc:connect(?RDBMS:connection_string(), 
+	                odbc_test_lib:platform_options()),
+
+    Table = ?config(tableName, Config),
+
+    {updated, _} =
+	    odbc:sql_query(Ref1,
+		       "CREATE TABLE " ++ Table ++
+		       " (ID integer, DATA varchar(10))"),
+
+    ok = odbc:auto_commit(Ref1, off),
+
+    {updated, 1} =
+	    odbc:sql_query(Ref1, "INSERT INTO " ++ Table ++ " VALUES(1,'bar')"),
+    {ok, 0} = odbc:select_count(Ref2, "SELECT * FROM " ++ Table),
+
+    ok = odbc:commit(Ref1, commit),
+    {ok, 1} = odbc:select_count(Ref2, "SELECT * FROM " ++ Table),
+
+    ok = odbc:auto_commit(Ref1, on),
+
+	odbc:sql_query(Ref1, "INSERT INTO " ++ Table ++ " VALUES(2,'foo')"),
+    {ok, 2} = odbc:select_count(Ref2, "SELECT * FROM " ++ Table),
+
+    ok = odbc:disconnect(Ref1),
+    ok = odbc:disconnect(Ref2).
 
 %%-------------------------------------------------------------------------
 %% Internal functions

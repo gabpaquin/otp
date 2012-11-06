@@ -61,6 +61,7 @@
 #define PARAM_QUERY		16
 #define DESCRIBE                17
 #define SHUTDOWN		18
+#define AUTO_COMMIT		19
 #define LENGTH_INDICATOR_SIZE	4
 #define INT_VALUE		1
 #define STR_VALUE		2
@@ -91,6 +92,7 @@
 #define EXIT_DESC		 21
 #define EXIT_BIND		 22
 #define EXIT_DRIVER_INFO         23
+#define EXIT_AUTO_COMMIT         24
 
 /* COL_SIZE */
 #define COL_SQL_SMALLINT 5

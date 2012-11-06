@@ -123,6 +123,20 @@
   </section>
   <funcs>
     <func>
+      <name>auto_commit(Ref, How) -></name>
+      <name>auto_commit(Ref, How, TimeOut) -> ok | {error, Reason} </name>
+      <fsummary>Changes auto_commit mode. after connection is established.</fsummary>
+      <type>
+        <v>Ref = connection_reference() </v>
+        <v>How = on | off</v>
+        <v>TimeOut = time_out()</v>
+      </type>
+      <desc>
+        <p>Changes auto_commit mode after connection is established.</p>
+      </desc>
+    </func>
+
+    <func>
       <name>commit(Ref, CommitMode) -></name>
       <name>commit(Ref, CommitMode, TimeOut) -> ok | {error, Reason} </name>
       <fsummary>Commits or rollbacks a transaction. </fsummary>

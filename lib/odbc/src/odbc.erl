@@ -32,7 +32,7 @@
 	 sql_query/3, select_count/2, select_count/3, first/1, first/2,
 	 last/1, last/2, next/1, next/2, prev/1, prev/2, select/3,
 	 select/4, param_query/3, param_query/4, describe_table/2,
-	 describe_table/3]).
+	 describe_table/3, auto_commit/2, auto_commit/3]).
 
 %%-------------------------------------------------------------------------
 %% supervisor callbacks
@@ -103,7 +103,6 @@ stop() ->
 %%              to the database. 
 %%-------------------------------------------------------------------------
 connect(ConnectionStr, Options) when is_list(ConnectionStr), is_list(Options) ->
-    
     %% Spawn the erlang control process.
     try  supervisor:start_child(odbc_sup, [[{client, self()}]]) of
 	 {ok, Pid} ->
@@ -400,6 +399,30 @@ describe_table(ConnectionReference, Table, TimeOut)
   when is_pid(ConnectionReference),is_list(Table),is_integer(TimeOut),TimeOut>0 -> 
     ODBCCmd = [?DESCRIBE, "SELECT * FROM " ++ Table],
     call(ConnectionReference, {describe_table, ODBCCmd}, TimeOut).
+
+%%--------------------------------------------------------------------------
+%% auto_commit(ConnectionReference, How, <TimeOut>) -> ok.
+%%
+%% How - on | off.
+%% Description: Enable or dissable auto commit for given connection.
+%%--------------------------------------------------------------------------
+auto_commit(ConnectionReference, How) ->
+    auto_commit(ConnectionReference, How, ?DEFAULT_TIMEOUT).
+
+auto_commit(ConnectionReference, How, TimeOut) when
+        is_pid(ConnectionReference) andalso is_atom(How) andalso
+        (
+            (is_integer(TimeOut) andalso TimeOut > 0) orelse
+            TimeOut =:= infinity
+        ) ->
+    AutoCommitMode =
+        case How of
+            on -> ?ON;
+            off -> ?OFF
+        end,
+    ODBCCmd = [?AUTO_COMMIT, AutoCommitMode],
+    call(ConnectionReference, {auto_commit, ODBCCmd}, TimeOut).
+
 %%%=========================================================================
 %%% Start/stop
 %%%=========================================================================
@@ -564,6 +587,15 @@ handle_msg({param_query, ODBCCmd}, Timeout, State) ->
 handle_msg({describe_table, ODBCCmd}, Timeout, State) ->
     odbc_send(State#state.odbc_socket, ODBCCmd),
     {noreply, State#state{result_set = undefined}, Timeout};
+
+handle_msg({auto_commit, ODBCCmd}, Timeout, State) ->
+    odbc_send(State#state.odbc_socket, ODBCCmd),
+    How =
+        case ODBCCmd of
+            [_, ?ON] -> on;
+            [_, ?OFF] -> off
+        end,
+    {noreply, State#state{auto_commit_mode=How}, Timeout};
 
 handle_msg({select_count, ODBCCmd}, Timeout, State) ->
     odbc_send(State#state.odbc_socket, ODBCCmd),
