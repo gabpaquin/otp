@@ -198,6 +198,10 @@ static ERL_NIF_TERM dh_generate_parameters_nif(ErlNifEnv* env, int argc, const E
 static ERL_NIF_TERM dh_check(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM dh_generate_key_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM dh_compute_key_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM srp_tls_client_pubkey(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM srp_tls_server_pubkey(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM srp_tls_client_premaster(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM srp_tls_server_premaster(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM bf_cfb64_crypt(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM bf_cbc_crypt(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM bf_ecb_crypt(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
@@ -319,6 +323,10 @@ static ErlNifFunc nif_funcs[] = {
     {"dh_check", 1, dh_check},
     {"dh_generate_key_nif", 2, dh_generate_key_nif},
     {"dh_compute_key_nif", 3, dh_compute_key_nif},
+    {"srp_tls_client_pubkey", 3, srp_tls_client_pubkey},
+    {"srp_tls_server_pubkey", 4, srp_tls_server_pubkey},
+    {"srp_tls_client_premaster", 6, srp_tls_client_premaster},
+    {"srp_tls_server_premaster", 5, srp_tls_server_premaster},
     {"bf_cfb64_crypt", 4, bf_cfb64_crypt},
     {"bf_cbc_crypt", 4, bf_cbc_crypt},
     {"bf_ecb_crypt", 3, bf_ecb_crypt},
@@ -1422,6 +1430,17 @@ static int get_bn_from_mpint(ErlNifEnv* env, ERL_NIF_TERM term, BIGNUM** bnp)
     return 1;
 }
 
+static int get_bn_from_bin(ErlNifEnv* env, ERL_NIF_TERM term, BIGNUM** bnp)
+{
+    ErlNifBinary bin;
+    if (!enif_inspect_binary(env,term,&bin)) {
+	return 0;
+    }
+    ERL_VALGRIND_ASSERT_MEM_DEFINED(bin.data, bin.size);
+    *bnp = BN_bin2bn(bin.data, bin.size, NULL);
+    return 1;
+}
+
 static ERL_NIF_TERM rand_uniform_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {/* (Lo,Hi) */
     BIGNUM *bn_from = NULL, *bn_to, *bn_rand;
@@ -2248,6 +2267,314 @@ static ERL_NIF_TERM dh_compute_key_nif(ErlNifEnv* env, int argc, const ERL_NIF_T
     }
     if (pubkey) BN_free(pubkey);
     DH_free(dh_params);
+    return ret;
+}
+
+/*
+ * SHA1_Update(PAD(g))
+ *
+ * from RFC-5054:
+ *    If a conversion is explicitly specified with the
+ *    operator PAD(), the integer will first be implicitly converted, then
+ *    the resultant byte-string will be left-padded with zeros (if
+ *    necessary) until its length equals the implicitly-converted length of
+ *    N (the prime).
+ */
+#define SHA_BLOCK_SIZE 64
+static void SHA1_Update_PAD(SHA_CTX *c, const void *data,
+			    unsigned long len, unsigned long pad)
+{
+    int cnt;
+    char zero[SHA_BLOCK_SIZE];
+
+    if (pad) {
+	memset(&zero, 0, SHA_BLOCK_SIZE);
+	while (pad > 0) {
+	    cnt = SHA_BLOCK_SIZE < pad ? SHA_BLOCK_SIZE : pad;
+	    SHA1_Update(c, &zero, cnt);
+	    pad -= cnt;
+	}
+    }
+    SHA1_Update(c, data, len);
+}
+
+/*
+ * k = SHA1(N | PAD(g))
+ */
+static BIGNUM *srp_calc_multiplier(ErlNifBinary *prime, ErlNifBinary *generator)
+{
+    unsigned char result[SHA_DIGEST_LENGTH];
+    SHA_CTX sha_ctx;
+
+    SHA1_Init(&sha_ctx);
+    SHA1_Update(&sha_ctx, prime->data, prime->size);
+    SHA1_Update_PAD(&sha_ctx, generator->data, generator->size, prime->size - generator->size);
+    SHA1_Final(result, &sha_ctx);
+
+    return BN_bin2bn(result, SHA_DIGEST_LENGTH, NULL);
+}
+
+/*
+ * SHA1(PAD(A) | PAD(B))
+ */
+static BIGNUM *srp_calc_pubhash(ErlNifBinary *clnt_pub, ErlNifBinary *srvr_pub, int prime_len)
+{
+    unsigned char result[SHA_DIGEST_LENGTH];
+    SHA_CTX sha_ctx;
+
+    SHA1_Init(&sha_ctx);
+    SHA1_Update_PAD(&sha_ctx, clnt_pub->data, clnt_pub->size, prime_len - clnt_pub->size);
+    SHA1_Update_PAD(&sha_ctx, srvr_pub->data, srvr_pub->size, prime_len - srvr_pub->size);
+    SHA1_Final(result, &sha_ctx);
+
+    return BN_bin2bn(result, SHA_DIGEST_LENGTH, NULL);
+}
+
+static ERL_NIF_TERM srp_tls_client_pubkey(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{/* (PrivKey, Prime, Generator) */
+    ErlNifBinary privkey;
+    BIGNUM *bn_privkey=NULL, *bn_generator=NULL, *bn_prime=NULL, *bn_result;
+    BN_CTX *bn_ctx;
+    unsigned char* ptr;
+    unsigned dlen;
+    ERL_NIF_TERM ret;
+
+    if (!enif_inspect_binary(env, argv[0], &privkey)
+	|| !get_bn_from_bin(env, argv[1], &bn_prime)
+	|| !get_bn_from_bin(env, argv[2], &bn_generator)) {
+
+	if (bn_prime) BN_free(bn_prime);
+	if (bn_generator) BN_free(bn_generator);
+	return enif_make_badarg(env);
+    }
+
+    bn_privkey = BN_bin2bn(privkey.data, privkey.size, NULL);
+    bn_result = BN_new();
+    bn_ctx = BN_CTX_new();
+    BN_mod_exp(bn_result, bn_generator, bn_privkey, bn_prime, bn_ctx);
+    if (BN_is_zero(bn_result)) {
+	ret = atom_error;
+    } else {
+	dlen = BN_num_bytes(bn_result);
+	ptr = enif_make_new_binary(env, dlen, &ret);
+	BN_bn2bin(bn_result, ptr);
+    }
+    BN_free(bn_result);
+    BN_CTX_free(bn_ctx);
+    BN_free(bn_prime);
+    BN_free(bn_generator);
+    BN_free(bn_privkey);
+    return ret;
+}
+
+static ERL_NIF_TERM srp_tls_server_pubkey(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{/* (PrivKey, Prime, Generator, Verifier) */
+    BIGNUM *bn_verifier = NULL;
+    BIGNUM *bn_privkey, *bn_generator, *bn_prime, *bn_multiplier, *bn_result;
+    ErlNifBinary privkey, prime, generator;
+    BN_CTX *bn_ctx;
+    unsigned char* ptr;
+    unsigned dlen;
+    ERL_NIF_TERM ret;
+
+    if (!enif_inspect_binary(env, argv[0], &privkey)
+	|| !enif_inspect_binary(env, argv[1], &prime)
+	|| !enif_inspect_binary(env,argv[2], &generator)
+	|| !get_bn_from_bin(env, argv[3], &bn_verifier)) {
+
+	if (bn_verifier) BN_free(bn_verifier);
+	return enif_make_badarg(env);
+    }
+
+    bn_privkey = BN_bin2bn(privkey.data, privkey.size, NULL);
+    bn_generator = BN_bin2bn(generator.data, generator.size, NULL);
+    bn_prime = BN_bin2bn(prime.data, prime.size, NULL);
+    bn_result = BN_new();
+    bn_ctx = BN_CTX_new();
+
+    /* k = SHA1(N | PAD(g)) */
+    bn_multiplier = srp_calc_multiplier(&prime, &generator);
+
+    /* B = k*v + g^b % N */
+
+    /* k * v */
+    BN_mod_mul(bn_multiplier, bn_multiplier, bn_verifier, bn_prime, bn_ctx);
+
+    /* g^b % N */
+    BN_mod_exp(bn_result, bn_generator, bn_privkey, bn_prime, bn_ctx);
+
+    /* k*v + g^b % N */
+    BN_mod_add(bn_result, bn_result, bn_multiplier, bn_prime, bn_ctx);
+
+    /* check that B % N != 0, reuse bn_mutiplier */
+    BN_nnmod(bn_multiplier, bn_result, bn_prime, bn_ctx);
+    if (BN_is_zero(bn_multiplier)) {
+	ret = atom_error;
+    } else {
+	dlen = BN_num_bytes(bn_result);
+	ptr = enif_make_new_binary(env, dlen, &ret);
+	BN_bn2bin(bn_result, ptr);
+    }
+    BN_free(bn_result);
+    BN_CTX_free(bn_ctx);
+    BN_free(bn_prime);
+    BN_free(bn_generator);
+    BN_free(bn_multiplier);
+    BN_free(bn_privkey);
+    BN_free(bn_verifier);
+    return ret;
+}
+
+static ERL_NIF_TERM srp_tls_client_premaster(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{/* (UserPassHash, ClntPrivKey, ClntPubKey, SrvrPubKey, Prime, Generator) */
+/*
+        u = SHA1(PAD(A) | PAD(B))
+        k = SHA1(N | PAD(g))
+        x = SHA1(s | SHA1(I | ":" | P))
+        <premaster secret> = (B - (k * g^x)) ^ (a + (u * x)) % N
+*/
+    ErlNifBinary clnt_pub, srvr_pub, prime, generator;
+    BIGNUM *bn_userpass = NULL, *bn_clnt_priv = NULL;
+    BIGNUM *bn_u, *bn_multiplier, *bn_exponent, *bn_base,
+	*bn_prime, *bn_generator, *bn_srvr_pub, *bn_result;
+    BN_CTX *bn_ctx;
+    unsigned char* ptr;
+    unsigned dlen;
+    ERL_NIF_TERM ret;
+
+    if (!get_bn_from_bin(env, argv[0], &bn_userpass)
+	|| !get_bn_from_bin(env, argv[1], &bn_clnt_priv)
+	|| !enif_inspect_binary(env, argv[2], &clnt_pub)
+	|| !enif_inspect_binary(env, argv[3], &srvr_pub)
+	|| !enif_inspect_binary(env, argv[4], &prime)
+	|| !enif_inspect_binary(env, argv[5], &generator))
+    {
+	if (bn_userpass) BN_free(bn_userpass);
+	if (bn_clnt_priv) BN_free(bn_clnt_priv);
+	return enif_make_badarg(env);
+    }
+
+    bn_prime = BN_bin2bn(prime.data, prime.size, NULL);
+    bn_generator = BN_bin2bn(generator.data, generator.size, NULL);
+    bn_srvr_pub = BN_bin2bn(srvr_pub.data, srvr_pub.size, NULL);
+
+    bn_ctx = BN_CTX_new();
+    bn_result = BN_new();
+
+    /* check that B % N != 0 */
+    BN_nnmod(bn_result, bn_srvr_pub, bn_prime, bn_ctx);
+    if (BN_is_zero(bn_result)) {
+	BN_free(bn_userpass);
+	BN_free(bn_clnt_priv);
+	BN_free(bn_generator);
+	BN_free(bn_prime);
+	BN_free(bn_srvr_pub);
+	BN_CTX_free(bn_ctx);
+
+	return atom_error;
+    }
+
+    bn_u = srp_calc_pubhash(&clnt_pub, &srvr_pub, prime.size);
+    bn_multiplier = srp_calc_multiplier(&prime, &generator);
+
+    /* (B - (k * g^x)) */
+    bn_base = BN_new();
+    BN_mod_exp(bn_result, bn_generator, bn_userpass, bn_prime, bn_ctx);
+    BN_mod_mul(bn_result, bn_multiplier, bn_result, bn_prime, bn_ctx);
+    BN_mod_sub(bn_base, bn_srvr_pub, bn_result, bn_prime, bn_ctx);
+
+    /* bn_clnt_priv + (bn_u * bn_userpass) */
+    bn_exponent = BN_new();
+    BN_mod_mul(bn_result, bn_u, bn_userpass, bn_prime, bn_ctx);
+    BN_mod_add(bn_exponent, bn_clnt_priv, bn_result, bn_prime, bn_ctx);
+
+    /* (B - (k * g^x)) ^ (a + (u * x)) % N */
+    BN_mod_exp(bn_result, bn_base, bn_exponent, bn_prime, bn_ctx);
+
+    dlen = BN_num_bytes(bn_result);
+    ptr = enif_make_new_binary(env, dlen, &ret);
+    BN_bn2bin(bn_result, ptr);
+    BN_free(bn_result);
+    BN_CTX_free(bn_ctx);
+
+    BN_free(bn_multiplier);
+    BN_free(bn_exponent);
+    BN_free(bn_u);
+    BN_free(bn_userpass);
+    BN_free(bn_clnt_priv);
+    BN_free(bn_srvr_pub);
+    BN_free(bn_base);
+    BN_free(bn_generator);
+    BN_free(bn_prime);
+    return ret;
+}
+
+static ERL_NIF_TERM srp_tls_server_premaster(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{/* (SrvrPrivKey, SrvrPubKey, ClntPubKey, Verifier, Prime) */
+/*
+        A = <read from client>
+        u = SHA1(PAD(A) | PAD(B))
+        <premaster secret> = (A * v^u) ^ b % N
+*/
+    ErlNifBinary srvr_pub, clnt_pub, prime;
+    BIGNUM *bn_srvr_priv = NULL, *bn_verifier = NULL;
+    BIGNUM *bn_prime, *bn_clnt_pub, *bn_u, *bn_base, *bn_result;
+    BN_CTX *bn_ctx;
+    unsigned char* ptr;
+    unsigned dlen;
+    ERL_NIF_TERM ret;
+
+    if (!get_bn_from_bin(env, argv[0], &bn_verifier)
+	|| !get_bn_from_bin(env, argv[1], &bn_srvr_priv)
+	|| !enif_inspect_binary(env, argv[2], &srvr_pub)
+	|| !enif_inspect_binary(env, argv[3], &clnt_pub)
+	|| !enif_inspect_binary(env, argv[4], &prime))
+    {
+	if (bn_verifier) BN_free(bn_verifier);
+	if (bn_srvr_priv) BN_free(bn_srvr_priv);
+	return enif_make_badarg(env);
+    }
+
+    bn_prime = BN_bin2bn(prime.data, prime.size, NULL);
+    bn_clnt_pub = BN_bin2bn(clnt_pub.data, clnt_pub.size, NULL);
+
+    bn_ctx = BN_CTX_new();
+    bn_result = BN_new();
+
+    /* check that A % N != 0 */
+    BN_nnmod(bn_result, bn_clnt_pub, bn_prime, bn_ctx);
+    if (BN_is_zero(bn_result)) {
+	BN_free(bn_srvr_priv);
+	BN_free(bn_verifier);
+	BN_free(bn_prime);
+	BN_free(bn_clnt_pub);
+	BN_CTX_free(bn_ctx);
+
+	return atom_error;
+    }
+
+    bn_u = srp_calc_pubhash(&clnt_pub, &srvr_pub, prime.size);
+
+    /* (A * v^u) */
+    bn_base = BN_new();
+    BN_mod_exp(bn_base, bn_verifier, bn_u, bn_prime, bn_ctx);
+    BN_mod_mul(bn_base, bn_clnt_pub, bn_base, bn_prime, bn_ctx);
+
+    /* (A * v^u) ^ b % N */
+    BN_mod_exp(bn_result, bn_base, bn_srvr_priv, bn_prime, bn_ctx);
+
+    dlen = BN_num_bytes(bn_result);
+    ptr = enif_make_new_binary(env, dlen, &ret);
+    BN_bn2bin(bn_result, ptr);
+    BN_free(bn_result);
+    BN_CTX_free(bn_ctx);
+
+    BN_free(bn_u);
+    BN_free(bn_base);
+    BN_free(bn_verifier);
+    BN_free(bn_prime);
+    BN_free(bn_clnt_pub);
+    BN_free(bn_srvr_priv);
     return ret;
 }
 

@@ -68,6 +68,10 @@ INTERNAL_HRL_FILES = \
 	 ssl_alert.hrl ssl_cipher.hrl ssl_handshake.hrl ssl_internal.hrl \
 	 ssl_record.hrl
 
+HRL_FILES = \
+	../include/ssl_srp.hrl \
+	../include/ssl_srp_primes.hrl
+
 ERL_FILES= \
 	$(MODULES:%=%.erl) \
 	$(BEHAVIOUR_MODULES:%=%.erl)
@@ -123,7 +127,9 @@ include $(ERL_TOP)/make/otp_release_targets.mk
 
 release_spec: opt
 	$(INSTALL_DIR) "$(RELSYSDIR)/src"
-	$(INSTALL_DATA) $(ERL_FILES) $(INTERNAL_HRL_FILES) "$(RELSYSDIR)/src"
+	$(INSTALL_DATA) $(ERL_FILES) $(INTERAL_HRL_FILES) "$(RELSYSDIR)/src"
+	$(INSTALL_DIR) "$(RELSYSDIR)/include"
+	$(INSTALL_DATA) $(HRL_FILES) "$(RELSYSDIR)/include"
 	$(INSTALL_DIR) "$(RELSYSDIR)/ebin"
 	$(INSTALL_DATA) $(BEHAVIOUR_TARGET_FILES) $(TARGET_FILES) $(APP_TARGET) \
 	$(APPUP_TARGET) "$(RELSYSDIR)/ebin"

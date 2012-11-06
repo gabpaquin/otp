@@ -70,6 +70,7 @@
 	 dsa_sign_hash_test/1,
 	 rsa_encrypt_decrypt/1,
 	 dh/1,
+	 srp/1,
 	 exor_test/1,
 	 rc4_test/1,
 	 rc4_stream_test/1,
@@ -96,7 +97,7 @@ groups() ->
        rand_uniform_test, strong_rand_test,
        rsa_verify_test, dsa_verify_test, rsa_sign_test,
        rsa_sign_hash_test, dsa_sign_test, dsa_sign_hash_test,
-       rsa_encrypt_decrypt, dh, exor_test,
+       rsa_encrypt_decrypt, dh, srp, exor_test,
        rc4_test, rc4_stream_test, mod_exp_test, blowfish_cfb64,
        smp]}].
 
@@ -1973,6 +1974,55 @@ dh(Config) when is_list(Config) ->
 	    io:format("Killing Param generation which took to long ~p~n",[Pid]),
 	    exit(Pid, kill)
     end.
+
+srp(doc) ->
+    ["Test SRP vectors from RFC5054."];
+srp(suite) -> [];
+srp(Config) when is_list(Config) ->
+    Username = <<"alice">>,
+    Password = <<"password123">>,
+    Salt = hexstr2bin("BEB25379D1A8581EB5A727673A2441EE"),
+    Prime = hexstr2bin("EEAF0AB9ADB38DD69C33F80AFA8FC5E86072618775FF3C0B9EA2314C"
+		       "9C256576D674DF7496EA81D3383B4813D692C6E0E0D5D8E250B98BE4"
+		       "8E495C1D6089DAD15DC7D7B46154D6B6CE8EF4AD69B15D4982559B29"
+		       "7BCF1885C529F566660E57EC68EDBC3C05726CC02FD4CBF4976EAA9A"
+		       "FD5138FE8376435B9FC61D2FC0EB06E3"),
+    Generator = <<2>>,
+    Multiplier = hexstr2bin("7556AA045AEF2CDD07ABAF0F665C3E818913186F"),
+    %% X = hexstr2bin("94B7555AABE9127CC58CCF4993DB6CF84D16C124"),
+    Verifier = hexstr2bin("7E273DE8696FFC4F4E337D05B4B375BEB0DDE1569E8FA00A9886D812"
+			  "9BADA1F1822223CA1A605B530E379BA4729FDC59F105B4787E5186F5"
+			  "C671085A1447B52A48CF1970B4FB6F8400BBF4CEBFBB168152E08AB5"
+			  "EA53D15C1AFF87B2B9DA6E04E058AD51CC72BFC9033B564E26480D78"
+			  "E955A5E29E7AB245DB2BE315E2099AFB"),
+    ClntPriv = hexstr2bin("60975527035CF2AD1989806F0407210BC81EDC04E2762A56AFD529DD"
+			  "DA2D4393"),
+    SrvrPriv = hexstr2bin("E487CB59D31AC550471E81F00F6928E01DDA08E974A004F49E61F5D1"
+			  "05284D20"),
+    ClntPub = hexstr2bin("61D5E490F6F1B79547B0704C436F523DD0E560F0C64115BB72557EC4"
+			 "4352E8903211C04692272D8B2D1A5358A2CF1B6E0BFCF99F921530EC"
+			 "8E39356179EAE45E42BA92AEACED825171E1E8B9AF6D9C03E1327F44"
+			 "BE087EF06530E69F66615261EEF54073CA11CF5858F0EDFDFE15EFEA"
+			 "B349EF5D76988A3672FAC47B0769447B"),
+    SrvrPub = hexstr2bin("BD0C61512C692C0CB6D041FA01BB152D4916A1E77AF46AE105393011"
+			 "BAF38964DC46A0670DD125B95A981652236F99D9B681CBF87837EC99"
+			 "6C6DA04453728610D0C6DDB58B318885D7D82C7F8DEB75CE7BD4FBAA"
+			 "37089E6F9C6059F388838E7A00030B331EB76840910440B1B27AAEAE"
+			 "EB4012B7D7665238A8E3FB004B117B58"),
+    %% U = hexstr2bin("CE38B9593487DA98554ED47D70A7AE5F462EF019"),
+
+    PremasterSecret = hexstr2bin("B0DC82BABCF30674AE450C0287745E7990A3381F63B387AAF271A10D"
+				 "233861E359B48220F7C4693C9AE12B0A6F67809F0876E2D013800D6C"
+				 "41BB59B6D5979B5C00A172B4A2A5903A0BDCAF8A709585EB2AFAFA8F"
+				 "3499B200210DCC1F10EB33943CD67FC88A2F39A4BE5BEC4EC0A3212D"
+				 "C346D7E474B29EDE8A469FFECA686E5A"),
+    UserPassHash = crypto:sha([Salt, crypto:sha([Username, <<$:>>, Password])]),
+    ?line m(crypto:srp_verifier(UserPassHash, Prime, Generator), Verifier),
+    ?line m(crypto:srp_tls_client_pubkey(ClntPriv, Prime, Generator), ClntPub),
+    ?line m(crypto:srp_tls_server_pubkey(SrvrPriv, Prime, Generator, Verifier), SrvrPub),
+    ?line m(crypto:srp_tls_client_premaster(UserPassHash, ClntPriv, ClntPub, SrvrPub, Prime, Generator), PremasterSecret),
+    ?line m(crypto:srp_tls_server_premaster(Verifier, SrvrPriv, SrvrPub, ClntPub, Prime), PremasterSecret),
+    ok.
 
 %%
 %%

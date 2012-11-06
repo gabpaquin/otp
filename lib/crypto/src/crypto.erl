@@ -58,6 +58,10 @@
 -export([rand_bytes/1, rand_bytes/3, rand_uniform/2]).
 -export([strong_rand_bytes/1, strong_rand_mpint/3]).
 -export([mod_exp/3, mpint/1, erlint/1]).
+-export([srp_verifier/3]).
+-export([srp_tls_client_pubkey/3, srp_tls_server_pubkey/4]).
+-export([srp_tls_client_premaster/6, srp_tls_server_premaster/5]).
+
 %% -export([idea_cbc_encrypt/3, idea_cbc_decrypt/3]).
 -export([aes_cbc_128_encrypt/3, aes_cbc_128_decrypt/3]).
 -export([aes_cbc_256_encrypt/3, aes_cbc_256_decrypt/3]).
@@ -1039,6 +1043,25 @@ dh_compute_key(OthersPublicKey, MyPrivateKey, DHParameters) ->
 dh_compute_key_nif(_OthersPublicKey, _MyPrivateKey, _DHParameters) -> ?nif_stub.
 
 %%
+%% SRP functions for TLS
+%%
+-spec srp_verifier(binary(), binary(), binary()) -> binary().
+srp_verifier(UserPassHash, Prime, Generator) ->
+    bn2bin(mod_exp_nif(bin2bn(Generator), bin2bn(UserPassHash), bin2bn(Prime))).
+
+-spec srp_tls_client_pubkey(binary(), binary(), binary()) -> binary().
+srp_tls_client_pubkey(_PrivKey, _Prime, _Generator) -> ?nif_stub.
+
+-spec srp_tls_server_pubkey(binary(), binary(), binary(), binary()) -> binary().
+srp_tls_server_pubkey(_PrivKey, _Prime, _Generator, _Verifier) -> ?nif_stub.
+
+-spec srp_tls_client_premaster(binary(), binary(), binary(), binary(), binary(), binary()) -> binary().
+srp_tls_client_premaster(_Verifier, _ClntPrivKey, _ClntPubKey, _SrvrPubKey, _Prime, _Generator) -> ?nif_stub.
+
+-spec srp_tls_server_premaster(binary(), binary(), binary(), binary(), binary()) -> binary().
+srp_tls_server_premaster(_Verifier, _SrvrPrivKey, _SrvrPubKey, _ClntPubKey, _Prime) -> ?nif_stub.
+
+%%
 %%  LOCAL FUNCTIONS
 %%
 
@@ -1085,3 +1108,10 @@ erlint(<<MPIntSize:32/integer,MPIntValue/binary>>) ->
     Bits= MPIntSize * 8,
     <<Integer:Bits/integer>> = MPIntValue,
     Integer.
+
+bin2bn(Bin) ->
+    Len = erlang:byte_size(Bin),
+    <<?UINT32(Len), Bin/binary>>.
+
+bn2bin(<<_:32, Bin/binary>>) ->
+    Bin.

@@ -28,14 +28,15 @@
 -include("ssl_cipher.hrl").
 -include("ssl_alert.hrl").
 -include("ssl_internal.hrl").
+-include("../include/ssl_srp.hrl").
 -include_lib("public_key/include/public_key.hrl").
 
 -export([master_secret/4, client_hello/8, server_hello/5, hello/4,
 	 hello_request/0, certify/7, certificate/4,
-	 client_certificate_verify/6, certificate_verify/6,
+	 client_certificate_verify/6, certificate_verify/6, verify_signature/5,
 	 certificate_request/3, key_exchange/3, server_key_exchange_hash/2,
 	 finished/5, verify_connection/6, get_tls_handshake/3,
-	 decode_client_key/3, server_hello_done/0,
+	 decode_client_key/3, decode_server_key/3, server_hello_done/0,
 	 encode_handshake/2, init_handshake_history/0, update_handshake_history/2,
 	 decrypt_premaster_secret/2, prf/5, next_protocol/1]).
 
@@ -69,6 +70,7 @@ client_hello(Host, Port, ConnectionStates,
     Pending = ssl_record:pending_connection_state(ConnectionStates, read),
     SecParams = Pending#connection_state.security_parameters,
     Ciphers = available_suites(UserSuites, Version),
+    SRP = srp_user(SslOpts),
 
     Id = ssl_session:client_id({Host, Port, SslOpts}, Cache, CacheCb, OwnCert),
 
@@ -80,6 +82,7 @@ client_hello(Host, Port, ConnectionStates,
 
 		  renegotiation_info =
 		      renegotiation_info(client, ConnectionStates, Renegotiation),
+		  srp = SRP,
 		  hash_signs = default_hash_signs(),
 		  next_protocol_negotiation =
 		      encode_client_protocol_negotiation(SslOpts#ssl_options.next_protocol_selector, Renegotiation)
@@ -165,7 +168,8 @@ hello(#server_hello{cipher_suite = CipherSuite, server_version = Version,
 			       
 hello(#client_hello{client_version = ClientVersion, random = Random,
 		    cipher_suites = CipherSuites,
-		    renegotiation_info = Info} = Hello,
+		    renegotiation_info = Info,
+		    srp = SRP} = Hello,
       #ssl_options{versions = Versions,
 		   secure_renegotiate = SecureRenegotation} = SslOpts,
       {Port, Session0, Cache, CacheCb, ConnectionStates0, Cert}, Renegotiation) ->
@@ -174,13 +178,14 @@ hello(#client_hello{client_version = ClientVersion, random = Random,
     case ssl_record:is_acceptable_version(Version) of
 	true ->
 	    {Type, #session{cipher_suite = CipherSuite,
-			    compression_method = Compression} = Session} 
+			    compression_method = Compression} = Session1}
 		= select_session(Hello, Port, Session0, Version, 
 				 SslOpts, Cache, CacheCb, Cert),
 	    case CipherSuite of 
 		no_suite ->
 		    ?ALERT_REC(?FATAL, ?INSUFFICIENT_SECURITY);
 		_ ->
+		    Session = handle_srp_info(SRP, Session1),
 		    case handle_renegotiation_info(server, Info, ConnectionStates0,
 						   Renegotiation, SecureRenegotation, 
 						   CipherSuites) of
@@ -320,24 +325,35 @@ client_certificate_verify(OwnCert, MasterSecret, Version,
 %%
 %% Description: Checks that the certificate_verify message is valid.
 %%--------------------------------------------------------------------
-certificate_verify(Signature, {?'rsaEncryption', PublicKey, _}, Version,
-		   {HashAlgo, _SignAlgo}, MasterSecret, {_, Handshake}) ->
-    Hashes = calc_certificate_verify(Version, HashAlgo, MasterSecret, Handshake),
-    case certificate_verify_rsa(Hashes, HashAlgo, Signature, PublicKey, Version) of
+certificate_verify(Signature, PublicKeyInfo, Version,
+		   HashSign = {HashAlgo, _}, MasterSecret, {_, Handshake}) ->
+    Hash = calc_certificate_verify(Version, HashAlgo, MasterSecret, Handshake),
+    case verify_signature(Version, Hash, HashSign, Signature, PublicKeyInfo) of
 	true ->
 	    valid;
 	_ ->
-	    ?ALERT_REC(?FATAL, ?BAD_CERTIFICATE)
-    end;
-certificate_verify(Signature, {?'id-dsa', PublicKey, PublicKeyParams}, Version,
-		   {HashAlgo, _SignAlgo}, MasterSecret, {_, Handshake}) ->
-    Hashes = calc_certificate_verify(Version, HashAlgo, MasterSecret, Handshake),
-    case public_key:verify({digest, Hashes}, sha, Signature, {PublicKey, PublicKeyParams}) of
-	true ->
-	    valid;
-	false ->
     	    ?ALERT_REC(?FATAL, ?BAD_CERTIFICATE)
     end.
+
+%%--------------------------------------------------------------------
+-spec verify_signature(tls_version(), binary(), {term(), term()}, binary(),
+				   public_key_info()) -> true | false.
+%%
+%% Description: Checks that a public_key signature is valid.
+%%--------------------------------------------------------------------
+verify_signature(_Version, _Hash, {_HashAlgo, anon}, _Signature, _) ->
+    true;
+verify_signature({3, Minor}, Hash, {HashAlgo, rsa}, Signature, {?rsaEncryption, PubKey, _PubKeyParams})
+  when Minor >= 3 ->
+    public_key:verify({digest, Hash}, HashAlgo, Signature, PubKey);
+verify_signature(_Version, Hash, _HashAlgo, Signature, {?rsaEncryption, PubKey, _PubKeyParams}) ->
+    case public_key:decrypt_public(Signature, PubKey,
+				   [{rsa_pad, rsa_pkcs1_padding}]) of
+	Hash -> true;
+	_    -> false
+    end;
+verify_signature(_Version, Hash, {HashAlgo, dsa}, Signature, {?'id-dsa', PublicKey, PublicKeyParams}) ->
+    public_key:verify({digest, Hash}, HashAlgo, Signature, {PublicKey, PublicKeyParams}).
 
 
 %%--------------------------------------------------------------------
@@ -364,6 +380,10 @@ certificate_request(ConnectionStates, CertDbHandle, CertDbRef) ->
 		   {premaster_secret, binary(), public_key_info()} |
 		   {dh, binary()} |
 		   {dh, {binary(), binary()}, #'DHParameter'{}, {HashAlgo::atom(), SignAlgo::atom()},
+		   binary(), binary(), private_key()} |
+		   {psk, binary()} |
+		   {dhe_psk, binary(), binary()} |
+		   {srp, {binary(), binary()}, #srp_user{}, {HashAlgo::atom(), SignAlgo::atom()},
 		   binary(), binary(), private_key()}) ->
     #client_key_exchange{} | #server_key_exchange{}.
 %%
@@ -380,33 +400,90 @@ key_exchange(client, _Version, {dh, <<?UINT32(Len), PublicKey:Len/binary>>}) ->
 		dh_public = PublicKey}
 	       };
 
+key_exchange(client, _Version, {psk, Identity}) ->
+    #client_key_exchange{
+	      exchange_keys = #client_psk_identity{
+		identity = Identity}
+	       };
+
+key_exchange(client, _Version, {dhe_psk, Identity, <<?UINT32(Len), PublicKey:Len/binary>>}) ->
+    #client_key_exchange{
+	      exchange_keys = #client_dhe_psk_identity{
+		identity = Identity,
+		dh_public = PublicKey}
+	       };
+
+key_exchange(client, _Version, {psk_premaster_secret, PskIdentity, Secret, {_, PublicKey, _}}) ->
+    EncPremasterSecret =
+	encrypted_premaster_secret(Secret, PublicKey),
+    #client_key_exchange{
+		exchange_keys = #client_rsa_psk_identity{
+		  identity = PskIdentity,
+		  exchange_keys = EncPremasterSecret}};
+
+key_exchange(client, _Version, {srp, PublicKey}) ->
+    #client_key_exchange{
+	      exchange_keys = #client_srp_public{
+		srp_a = PublicKey}
+	       };
+
 key_exchange(server, Version, {dh, {<<?UINT32(Len), PublicKey:Len/binary>>, _},
 		      #'DHParameter'{prime = P, base = G},
-		      {HashAlgo, SignAlgo}, ClientRandom, ServerRandom, PrivateKey}) ->
+		      HashSign, ClientRandom, ServerRandom, PrivateKey}) ->
     <<?UINT32(_), PBin/binary>> = crypto:mpint(P),
     <<?UINT32(_), GBin/binary>> = crypto:mpint(G),
-    PLen = byte_size(PBin),
-    GLen = byte_size(GBin),
-    YLen = byte_size(PublicKey),
     ServerDHParams = #server_dh_params{dh_p = PBin, 
 				       dh_g = GBin, dh_y = PublicKey},    
+    enc_server_key_exchange(Version, ServerDHParams, HashSign,
+			    ClientRandom, ServerRandom, PrivateKey);
 
+key_exchange(server, Version, {psk, PskIdentityHint,
+			       HashSign, ClientRandom, ServerRandom, PrivateKey}) ->
+    ServerPSKParams = #server_psk_params{hint = PskIdentityHint},
+    enc_server_key_exchange(Version, ServerPSKParams, HashSign,
+			    ClientRandom, ServerRandom, PrivateKey);
+
+key_exchange(server, Version, {dhe_psk, PskIdentityHint, {<<?UINT32(Len), PublicKey:Len/binary>>, _},
+			       #'DHParameter'{prime = P, base = G},
+			       HashSign, ClientRandom, ServerRandom, PrivateKey}) ->
+    <<?UINT32(_), PBin/binary>> = crypto:mpint(P),
+    <<?UINT32(_), GBin/binary>> = crypto:mpint(G),
+    ServerEDHPSKParams = #server_dhe_psk_params{
+      hint = PskIdentityHint,
+      dh_params = #server_dh_params{dh_p = PBin,
+				    dh_g = GBin, dh_y = PublicKey}
+     },
+    enc_server_key_exchange(Version, ServerEDHPSKParams,
+			    HashSign, ClientRandom, ServerRandom, PrivateKey);
+
+key_exchange(server, Version, {srp, {PublicKey, _},
+			       #srp_user{prime = Prime, generator = Generator,
+					 salt = Salt},
+			       HashSign, ClientRandom, ServerRandom, PrivateKey}) ->
+    ServerSRPParams = #server_srp_params{srp_n = Prime, srp_g = Generator,
+					 srp_s = Salt, srp_b = PublicKey},
+    enc_server_key_exchange(Version, ServerSRPParams, HashSign,
+			    ClientRandom, ServerRandom, PrivateKey).
+
+enc_server_key_exchange(Version, Params, {HashAlgo, SignAlgo},
+			ClientRandom, ServerRandom, PrivateKey) ->
+    EncParams = enc_server_key(Params),
     case HashAlgo of
 	null ->
-	    #server_key_exchange{params = ServerDHParams,
-				 signed_params = <<>>,
-				 hashsign = {null, anon}};
+	    #server_key_params{params = Params,
+			       params_bin = EncParams,
+			       hashsign = {null, anon},
+			       signature = <<>>};
 	_ ->
 	    Hash =
 		server_key_exchange_hash(HashAlgo, <<ClientRandom/binary,
-						    ServerRandom/binary,
-						    ?UINT16(PLen), PBin/binary,
-						    ?UINT16(GLen), GBin/binary,
-						    ?UINT16(YLen), PublicKey/binary>>),
-	    Signed = digitally_signed(Version, Hash, HashAlgo, PrivateKey),
-	    #server_key_exchange{params = ServerDHParams,
-				 signed_params = Signed,
-				 hashsign = {HashAlgo, SignAlgo}}
+						     ServerRandom/binary,
+						     EncParams/binary>>),
+	    Signature = digitally_signed(Version, Hash, HashAlgo, PrivateKey),
+	    #server_key_params{params = Params,
+			       params_bin = EncParams,
+			       hashsign = {HashAlgo, SignAlgo},
+			       signature = Signature}
     end.
 
 %%--------------------------------------------------------------------
@@ -515,12 +592,26 @@ get_tls_handshake(Version, Data, Buffer) ->
 
 %%--------------------------------------------------------------------
 -spec decode_client_key(binary(), key_algo(), tls_version()) ->
-			    #encrypted_premaster_secret{} | #client_diffie_hellman_public{}.
+			    #encrypted_premaster_secret{}
+			    | #client_diffie_hellman_public{}
+			    | #client_psk_identity{}
+			    | #client_dhe_psk_identity{}
+			    | #client_rsa_psk_identity{}
+			    | #client_srp_public{}.
 %%
 %% Description: Decode client_key data and return appropriate type
 %%--------------------------------------------------------------------
 decode_client_key(ClientKey, Type, Version) ->
     dec_client_key(ClientKey, key_exchange_alg(Type), Version).
+
+%%--------------------------------------------------------------------
+-spec decode_server_key(binary(), key_algo(), tls_version()) ->
+			       #server_key_params{}.
+%%
+%% Description: Decode server_key data and return appropriate type
+%%--------------------------------------------------------------------
+decode_server_key(ServerKey, Type, Version) ->
+    dec_server_key(ServerKey, key_exchange_alg(Type), Version).
 
 %%--------------------------------------------------------------------
 -spec init_handshake_history() -> tls_handshake_history().
@@ -658,6 +749,11 @@ cipher_suites(Suites, false) ->
 cipher_suites(Suites, true) ->
     Suites.
 
+srp_user(#ssl_options{srp_identity = {UserName, _}}) ->
+    #srp{username = UserName};
+srp_user(_) ->
+    undefined.
+
 renegotiation_info(client, _, false) ->
     #renegotiation_info{renegotiated_connection = undefined};
 renegotiation_info(server, ConnectionStates, false) ->
@@ -739,6 +835,11 @@ select_next_protocol(Protocols, NextProtocolSelector) ->
 	Protocol when is_binary(Protocol)  ->
 	    Protocol
     end.
+
+handle_srp_info(undefined, Session) ->
+    Session;
+handle_srp_info(#srp{username = Username}, Session) ->
+    Session#session{srp_username = Username}.
 
 handle_renegotiation_info(_, #renegotiation_info{renegotiated_connection = ?byte(0)}, 
 			  ConnectionStates, false, _, _) ->
@@ -926,6 +1027,7 @@ dec_hs(_Version, ?CLIENT_HELLO, <<?BYTE(Major), ?BYTE(Minor), Random:32/binary,
 
     DecodedExtensions = dec_hello_extensions(Extensions),
     RenegotiationInfo = proplists:get_value(renegotiation_info, DecodedExtensions, undefined),
+    SRP = proplists:get_value(srp, DecodedExtensions, undefined),
     HashSigns = proplists:get_value(hash_signs, DecodedExtensions, undefined),
     NextProtocolNegotiation = proplists:get_value(next_protocol_negotiation, DecodedExtensions, undefined),
 
@@ -936,6 +1038,7 @@ dec_hs(_Version, ?CLIENT_HELLO, <<?BYTE(Major), ?BYTE(Minor), Random:32/binary,
        cipher_suites = from_2bytes(CipherSuites),
        compression_methods = Comp_methods,
        renegotiation_info = RenegotiationInfo,
+	srp = SRP,
        hash_signs = HashSigns,
        next_protocol_negotiation = NextProtocolNegotiation
       };
@@ -975,31 +1078,8 @@ dec_hs(_Version, ?SERVER_HELLO, <<?BYTE(Major), ?BYTE(Minor), Random:32/binary,
        next_protocol_negotiation = NextProtocolNegotiation};
 dec_hs(_Version, ?CERTIFICATE, <<?UINT24(ACLen), ASN1Certs:ACLen/binary>>) ->
     #certificate{asn1_certificates = certs_to_list(ASN1Certs)};
-
-dec_hs(_Version, ?SERVER_KEY_EXCHANGE, <<?UINT16(PLen), P:PLen/binary,
-			      ?UINT16(GLen), G:GLen/binary,
-			      ?UINT16(YLen), Y:YLen/binary,
-			       ?UINT16(0)>>) -> %% May happen if key_algorithm is dh_anon
-    #server_key_exchange{params = #server_dh_params{dh_p = P,dh_g = G,
-						    dh_y = Y},
-			 signed_params = <<>>, hashsign = {null, anon}};
-dec_hs({Major, Minor}, ?SERVER_KEY_EXCHANGE, <<?UINT16(PLen), P:PLen/binary,
-			      ?UINT16(GLen), G:GLen/binary,
-			      ?UINT16(YLen), Y:YLen/binary,
-			      ?BYTE(HashAlgo), ?BYTE(SignAlgo),
-			      ?UINT16(Len), Sig:Len/binary>>)
-  when Major == 3, Minor >= 3 ->
-    #server_key_exchange{params = #server_dh_params{dh_p = P,dh_g = G,
-						    dh_y = Y},
-			 signed_params = Sig,
-			 hashsign = {ssl_cipher:hash_algorithm(HashAlgo), ssl_cipher:sign_algorithm(SignAlgo)}};
-dec_hs(_Version, ?SERVER_KEY_EXCHANGE, <<?UINT16(PLen), P:PLen/binary,
-			      ?UINT16(GLen), G:GLen/binary,
-			      ?UINT16(YLen), Y:YLen/binary,
-			      ?UINT16(Len), Sig:Len/binary>>) ->
-    #server_key_exchange{params = #server_dh_params{dh_p = P,dh_g = G, 
-						    dh_y = Y},
-			 signed_params = Sig, hashsign = undefined};
+dec_hs(_Version, ?SERVER_KEY_EXCHANGE, Keys) ->
+    #server_key_exchange{exchange_keys = Keys};
 dec_hs({Major, Minor}, ?CERTIFICATE_REQUEST,
        <<?BYTE(CertTypesLen), CertTypes:CertTypesLen/binary,
 	?UINT16(HashSignsLen), HashSigns:HashSignsLen/binary,
@@ -1037,7 +1117,94 @@ dec_client_key(<<>>, ?KEY_EXCHANGE_DIFFIE_HELLMAN, _) ->
     throw(?ALERT_REC(?FATAL, ?UNSUPPORTED_CERTIFICATE));
 dec_client_key(<<?UINT16(DH_YLen), DH_Y:DH_YLen/binary>>,
 	       ?KEY_EXCHANGE_DIFFIE_HELLMAN, _) ->
-    #client_diffie_hellman_public{dh_public = DH_Y}.
+    #client_diffie_hellman_public{dh_public = DH_Y};
+dec_client_key(<<?UINT16(Len), Id:Len/binary>>,
+	       ?KEY_EXCHANGE_PSK, _) ->
+    #client_psk_identity{identity = Id};
+dec_client_key(<<?UINT16(Len), Id:Len/binary,
+		 ?UINT16(DH_YLen), DH_Y:DH_YLen/binary>>,
+	       ?KEY_EXCHANGE_DHE_PSK, _) ->
+    #client_dhe_psk_identity{identity = Id, dh_public = DH_Y};
+dec_client_key(<<?UINT16(Len), Id:Len/binary, PKEPMS/binary>>,
+	       ?KEY_EXCHANGE_RSA_PSK, {3, 0}) ->
+    #client_rsa_psk_identity{identity = Id, exchange_keys = #encrypted_premaster_secret{premaster_secret = PKEPMS}};
+dec_client_key(<<?UINT16(Len), Id:Len/binary, ?UINT16(_), PKEPMS/binary>>,
+	       ?KEY_EXCHANGE_RSA_PSK, _) ->
+    #client_rsa_psk_identity{identity = Id, exchange_keys = #encrypted_premaster_secret{premaster_secret = PKEPMS}};
+dec_client_key(<<?UINT16(ALen), A:ALen/binary>>,
+	       ?KEY_EXCHANGE_SRP, _) ->
+    #client_srp_public{srp_a = A}.
+
+dec_ske_params(Len, Keys, Version) ->
+    <<Params:Len/bytes, Signature/binary>> = Keys,
+    dec_ske_signature(Params, Signature, Version).
+
+dec_ske_signature(Params, <<?BYTE(HashAlgo), ?BYTE(SignAlgo),
+			    ?UINT16(0)>>, {Major, Minor})
+  when Major == 3, Minor >= 3 ->
+    HashSign = {ssl_cipher:hash_algorithm(HashAlgo), ssl_cipher:sign_algorithm(SignAlgo)},
+    {Params, HashSign, <<>>};
+dec_ske_signature(Params, <<?BYTE(HashAlgo), ?BYTE(SignAlgo),
+			    ?UINT16(Len), Signature:Len/binary>>, {Major, Minor})
+  when Major == 3, Minor >= 3 ->
+    HashSign = {ssl_cipher:hash_algorithm(HashAlgo), ssl_cipher:sign_algorithm(SignAlgo)},
+    {Params, HashSign, Signature};
+dec_ske_signature(Params, <<>>, _) ->
+    {Params, {null, anon}, <<>>};
+dec_ske_signature(Params, <<?UINT16(0)>>, _) ->
+    {Params, {null, anon}, <<>>};
+dec_ske_signature(Params, <<?UINT16(Len), Signature:Len/binary>>, _) ->
+    {Params, undefined, Signature};
+dec_ske_signature(_, _, _) ->
+    throw(?ALERT_REC(?FATAL, ?HANDSHAKE_FAILURE)).
+
+dec_server_key(<<?UINT16(PLen), P:PLen/binary,
+		 ?UINT16(GLen), G:GLen/binary,
+		 ?UINT16(YLen), Y:YLen/binary, _/binary>> = KeyStruct,
+	       ?KEY_EXCHANGE_DIFFIE_HELLMAN, Version) ->
+    Params = #server_dh_params{dh_p = P, dh_g = G, dh_y = Y},
+    {BinMsg, HashSign, Signature} = dec_ske_params(PLen + GLen + YLen + 6, KeyStruct, Version),
+    #server_key_params{params = Params,
+		       params_bin = BinMsg,
+		       hashsign = HashSign,
+		       signature = Signature};
+dec_server_key(<<?UINT16(Len), PskIdentityHint:Len/binary>> = KeyStruct,
+	       KeyExchange, Version)
+  when KeyExchange == ?KEY_EXCHANGE_PSK; KeyExchange == ?KEY_EXCHANGE_RSA_PSK ->
+    Params = #server_psk_params{
+      hint = PskIdentityHint},
+    {BinMsg, HashSign, Signature} = dec_ske_params(Len + 2, KeyStruct, Version),
+    #server_key_params{params = Params,
+		       params_bin = BinMsg,
+		       hashsign = HashSign,
+		       signature = Signature};
+dec_server_key(<<?UINT16(Len), IdentityHint:Len/binary,
+		 ?UINT16(PLen), P:PLen/binary,
+		 ?UINT16(GLen), G:GLen/binary,
+		 ?UINT16(YLen), Y:YLen/binary, _/binary>> = KeyStruct,
+	       ?KEY_EXCHANGE_DHE_PSK, Version) ->
+    DHParams = #server_dh_params{dh_p = P, dh_g = G, dh_y = Y},
+    Params = #server_dhe_psk_params{
+      hint = IdentityHint,
+      dh_params = DHParams},
+    {BinMsg, HashSign, Signature} = dec_ske_params(Len + PLen + GLen + YLen + 8, KeyStruct, Version),
+    #server_key_params{params = Params,
+		       params_bin = BinMsg,
+		       hashsign = HashSign,
+		       signature = Signature};
+dec_server_key(<<?UINT16(NLen), N:NLen/binary,
+		 ?UINT16(GLen), G:GLen/binary,
+		 ?BYTE(SLen), S:SLen/binary,
+		 ?UINT16(BLen), B:BLen/binary, _/binary>> = KeyStruct,
+	       ?KEY_EXCHANGE_SRP, Version) ->
+    Params = #server_srp_params{srp_n = N, srp_g = G, srp_s = S, srp_b = B},
+    {BinMsg, HashSign, Signature} = dec_ske_params(NLen + GLen + SLen + BLen + 7, KeyStruct, Version),
+    #server_key_params{params = Params,
+		       params_bin = BinMsg,
+		       hashsign = HashSign,
+		       signature = Signature};
+dec_server_key(_, _, _) ->
+    throw(?ALERT_REC(?FATAL, ?HANDSHAKE_FAILURE)).
 
 dec_hello_extensions(<<>>) ->
     [];
@@ -1062,6 +1229,11 @@ dec_hello_extensions(<<?UINT16(?RENEGOTIATION_EXT), ?UINT16(Len), Info:Len/binar
 		      end,	    
     dec_hello_extensions(Rest, [{renegotiation_info, 
 			   #renegotiation_info{renegotiated_connection = RenegotiateInfo}} | Acc]);
+
+dec_hello_extensions(<<?UINT16(?SRP_EXT), ?UINT16(Len), ?BYTE(SRPLen), SRP:SRPLen/binary, Rest/binary>>, Acc)
+  when Len == SRPLen + 2 ->
+    dec_hello_extensions(Rest, [{srp,
+			   #srp{username = SRP}} | Acc]);
 
 dec_hello_extensions(<<?UINT16(?SIGNATURE_ALGORITHMS_EXT), ?UINT16(Len),
 		       ExtData:Len/binary, Rest/binary>>, Acc) ->
@@ -1120,6 +1292,7 @@ enc_hs(#client_hello{client_version = {Major, Minor},
 		     cipher_suites = CipherSuites,
 		     compression_methods = CompMethods, 
 		     renegotiation_info = RenegotiationInfo,
+		     srp = SRP,
 		     hash_signs = HashSigns,
 		     next_protocol_negotiation = NextProtocolNegotiation}, _Version) ->
     SIDLength = byte_size(SessionID),
@@ -1127,7 +1300,7 @@ enc_hs(#client_hello{client_version = {Major, Minor},
     CmLength = byte_size(BinCompMethods),
     BinCipherSuites = list_to_binary(CipherSuites),
     CsLength = byte_size(BinCipherSuites),
-    Extensions0 = hello_extensions(RenegotiationInfo, NextProtocolNegotiation),
+    Extensions0 = hello_extensions(RenegotiationInfo, SRP, NextProtocolNegotiation),
     Extensions1 = if
 		      Major == 3, Minor >=3 -> Extensions0 ++ hello_extensions(HashSigns);
 		      true -> Extensions0
@@ -1156,18 +1329,12 @@ enc_hs(#certificate{asn1_certificates = ASN1CertList}, _Version) ->
     ASN1Certs = certs_from_list(ASN1CertList),
     ACLen = erlang:iolist_size(ASN1Certs),
     {?CERTIFICATE, <<?UINT24(ACLen), ASN1Certs:ACLen/binary>>};
-enc_hs(#server_key_exchange{params = #server_dh_params{
-			      dh_p = P, dh_g = G, dh_y = Y},
-	signed_params = SignedParams, hashsign = HashSign}, Version) ->
-    PLen = byte_size(P),
-    GLen = byte_size(G),
-    YLen = byte_size(Y),
-    Signature = enc_sign(HashSign, SignedParams, Version),
-    {?SERVER_KEY_EXCHANGE, <<?UINT16(PLen), P/binary, 
-			    ?UINT16(GLen), G/binary,
-			    ?UINT16(YLen), Y/binary,
-			    Signature/binary>>
-    };
+enc_hs(#server_key_exchange{exchange_keys = Keys}, _Version) ->
+    {?SERVER_KEY_EXCHANGE, Keys};
+enc_hs(#server_key_params{params_bin = Keys, hashsign = HashSign,
+			  signature = Signature}, Version) ->
+    EncSign = enc_sign(HashSign, Signature, Version),
+    {?SERVER_KEY_EXCHANGE, <<Keys/binary, EncSign/binary>>};
 enc_hs(#certificate_request{certificate_types = CertTypes,
 			    hashsign_algorithms = #hash_sign_algos{hash_sign_algos = HashSignAlgos},
 			    certificate_authorities = CertAuths},
@@ -1209,8 +1376,59 @@ enc_cke(#encrypted_premaster_secret{premaster_secret = PKEPMS}, _) ->
     <<?UINT16(PKEPMSLen), PKEPMS/binary>>;
 enc_cke(#client_diffie_hellman_public{dh_public = DHPublic}, _) ->
     Len = byte_size(DHPublic),
-    <<?UINT16(Len), DHPublic/binary>>.
+    <<?UINT16(Len), DHPublic/binary>>;
+enc_cke(#client_psk_identity{identity = undefined}, _) ->
+    Id = <<"psk_identity">>,
+    Len = byte_size(Id),
+    <<?UINT16(Len), Id/binary>>;
+enc_cke(#client_psk_identity{identity = Id}, _) ->
+    Len = byte_size(Id),
+    <<?UINT16(Len), Id/binary>>;
+enc_cke(Identity = #client_dhe_psk_identity{identity = undefined}, Version) ->
+    enc_cke(Identity#client_dhe_psk_identity{identity = <<"psk_identity">>}, Version);
+enc_cke(#client_dhe_psk_identity{identity = Id, dh_public = DHPublic}, _) ->
+    Len = byte_size(Id),
+    DHLen = byte_size(DHPublic),
+    <<?UINT16(Len), Id/binary, ?UINT16(DHLen), DHPublic/binary>>;
+enc_cke(Identity = #client_rsa_psk_identity{identity = undefined}, Version) ->
+    enc_cke(Identity#client_rsa_psk_identity{identity = <<"psk_identity">>}, Version);
+enc_cke(#client_rsa_psk_identity{identity = Id, exchange_keys = ExchangeKeys}, Version) ->
+    EncPMS = enc_cke(ExchangeKeys, Version),
+    Len = byte_size(Id),
+    <<?UINT16(Len), Id/binary, EncPMS/binary>>;
+enc_cke(#client_srp_public{srp_a = A}, _) ->
+    Len = byte_size(A),
+    <<?UINT16(Len), A/binary>>.
 
+enc_server_key(#server_dh_params{dh_p = P, dh_g = G, dh_y = Y}) ->
+    PLen = byte_size(P),
+    GLen = byte_size(G),
+    YLen = byte_size(Y),
+    <<?UINT16(PLen), P/binary, ?UINT16(GLen), G/binary, ?UINT16(YLen), Y/binary>>;
+enc_server_key(#server_psk_params{hint = PskIdentityHint}) ->
+    Len = byte_size(PskIdentityHint),
+    <<?UINT16(Len), PskIdentityHint/binary>>;
+enc_server_key(Params = #server_dhe_psk_params{hint = undefined}) ->
+    enc_server_key(Params#server_dhe_psk_params{hint = <<>>});
+enc_server_key(#server_dhe_psk_params{
+		  hint = PskIdentityHint,
+		  dh_params = #server_dh_params{dh_p = P, dh_g = G, dh_y = Y}}) ->
+    Len = byte_size(PskIdentityHint),
+    PLen = byte_size(P),
+    GLen = byte_size(G),
+    YLen = byte_size(Y),
+    <<?UINT16(Len), PskIdentityHint/binary,
+      ?UINT16(PLen), P/binary, ?UINT16(GLen), G/binary, ?UINT16(YLen), Y/binary>>;
+enc_server_key(#server_srp_params{srp_n = N, srp_g = G,	srp_s = S, srp_b = B}) ->
+    NLen = byte_size(N),
+    GLen = byte_size(G),
+    SLen = byte_size(S),
+    BLen = byte_size(B),
+    <<?UINT16(NLen), N/binary, ?UINT16(GLen), G/binary,
+      ?BYTE(SLen), S/binary, ?UINT16(BLen), B/binary>>.
+
+enc_sign({_, anon}, _Sign, _Version) ->
+    <<>>;
 enc_sign({HashAlg, SignAlg}, Signature, _Version = {Major, Minor})
   when Major == 3, Minor >= 3->
 	SignLen = byte_size(Signature),
@@ -1223,13 +1441,20 @@ enc_sign(_HashSign, Sign, _Version) ->
 hello_extensions(RenegotiationInfo, NextProtocolNegotiation) ->
     hello_extensions(RenegotiationInfo) ++ next_protocol_extension(NextProtocolNegotiation).
 
+hello_extensions(RenegotiationInfo, SRP, NextProtocolNegotiation) ->
+    hello_extensions(RenegotiationInfo) ++ hello_extensions(SRP) ++ next_protocol_extension(NextProtocolNegotiation).
+
 %% Renegotiation info
 hello_extensions(#renegotiation_info{renegotiated_connection = undefined}) ->
     [];
 hello_extensions(#renegotiation_info{} = Info) ->
     [Info];
+hello_extensions(#srp{} = Info) ->
+    [Info];
 hello_extensions(#hash_sign_algos{} = Info) ->
-    [Info].
+    [Info];
+hello_extensions(undefined) ->
+    [].
 
 next_protocol_extension(undefined) ->
     [];
@@ -1255,6 +1480,11 @@ enc_hello_extensions([#renegotiation_info{renegotiated_connection = Info} | Rest
     InfoLen = byte_size(Info),
     Len = InfoLen +1,
     enc_hello_extensions(Rest, <<?UINT16(?RENEGOTIATION_EXT), ?UINT16(Len), ?BYTE(InfoLen), Info/binary, Acc/binary>>);
+
+enc_hello_extensions([#srp{username = UserName} | Rest], Acc) ->
+    SRPLen = byte_size(UserName),
+    Len = SRPLen + 2,
+    enc_hello_extensions(Rest, <<?UINT16(?SRP_EXT), ?UINT16(Len), ?BYTE(SRPLen), UserName/binary, Acc/binary>>);
 
 enc_hello_extensions([#hash_sign_algos{hash_sign_algos = HashSignAlgos} | Rest], Acc) ->
     SignAlgoList = << <<(ssl_cipher:hash_algorithm(Hash)):8, (ssl_cipher:sign_algorithm(Sign)):8>> ||
@@ -1328,8 +1558,8 @@ certificate_authorities_from_db(CertDbHandle, CertDbRef) ->
 
 digitally_signed({3, Minor}, Hash, HashAlgo, Key) when Minor >= 3 ->
     public_key:sign({digest, Hash}, HashAlgo, Key);
-digitally_signed(_Version, Hash, _HashAlgo, #'DSAPrivateKey'{} = Key) ->
-    public_key:sign({digest, Hash}, sha, Key);
+digitally_signed(_Version, Hash, HashAlgo, #'DSAPrivateKey'{} = Key) ->
+    public_key:sign({digest, Hash}, HashAlgo, Key);
 digitally_signed(_Version, Hash, _HashAlgo, #'RSAPrivateKey'{} = Key) ->
     public_key:encrypt_private(Hash, Key,
 			       [{rsa_pad, rsa_pkcs1_padding}]).
@@ -1365,6 +1595,15 @@ key_exchange_alg(rsa) ->
 key_exchange_alg(Alg) when Alg == dhe_rsa; Alg == dhe_dss;
 			    Alg == dh_dss; Alg == dh_rsa; Alg == dh_anon ->
     ?KEY_EXCHANGE_DIFFIE_HELLMAN;
+key_exchange_alg(psk) ->
+    ?KEY_EXCHANGE_PSK;
+key_exchange_alg(dhe_psk) ->
+    ?KEY_EXCHANGE_DHE_PSK;
+key_exchange_alg(rsa_psk) ->
+    ?KEY_EXCHANGE_RSA_PSK;
+key_exchange_alg(Alg)
+  when Alg == srp_rsa; Alg == srp_dss; Alg == srp_anon ->
+    ?KEY_EXCHANGE_SRP;
 key_exchange_alg(_) ->
     ?NULL.
 
@@ -1376,19 +1615,6 @@ apply_user_fun(Fun, OtpCert, ExtensionOrError, UserState0, SslState) ->
 	    Fail;
 	{unknown, UserState} ->
 	    {unknown, {SslState, UserState}}
-    end.
-
-certificate_verify_rsa(Hashes, sha, Signature, PublicKey, {Major, Minor})
-  when Major == 3, Minor >= 3 ->
-    public_key:verify({digest, Hashes}, sha, Signature, PublicKey);
-certificate_verify_rsa(Hashes, HashAlgo, Signature, PublicKey, {Major, Minor})
-  when Major == 3, Minor >= 3 ->
-    public_key:verify({digest, Hashes}, HashAlgo, Signature, PublicKey);
-certificate_verify_rsa(Hashes, _HashAlgo, Signature, PublicKey, _Version) ->
-    case public_key:decrypt_public(Signature, PublicKey,
-				   [{rsa_pad, rsa_pkcs1_padding}]) of
-	Hashes -> true;
-	_      -> false
     end.
 
 -define(TLSEXT_SIGALG_RSA(MD), {MD, rsa}).
