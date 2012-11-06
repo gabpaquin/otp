@@ -675,10 +675,17 @@ lay_2(Node, Ctxt) ->
 
 	binary ->
 	    Ctxt1 = reset_prec(Ctxt),
-	    Es = seq(erl_syntax:binary_fields(Node),
-		     floating(text(",")), Ctxt1, fun lay/2),
+	    BinEls = erl_syntax:binary_fields(Node),
+	    Ints = lists:map(fun({integer,_,I}) -> I; (X) -> X end,
+	        [erl_syntax:binary_field_body(I) || I <- BinEls]),
+	    Es = case io_lib:printable_list(Ints) of
+	        true ->
+	            lay(erl_syntax:string(Ints), Ctxt1);
+	        false ->
+	            par(seq(BinEls, floating(text(",")), Ctxt1, fun lay/2))
+	    end,
 	    beside(floating(text("<<")),
-		   beside(par(Es), floating(text(">>"))));
+		   beside(Es, floating(text(">>"))));
 
 	binary_field ->
 	    Ctxt1 = set_prec(Ctxt, max_prec()),
